@@ -7,7 +7,10 @@
 
 #include <stdint.h>
 
+extern void nmi6502();
 uint8_t smc_read(uint8_t offset);
 void smc_write(uint8_t offset, uint8_t value);
+
+extern bool smc_requested_reset;
 
 #endif

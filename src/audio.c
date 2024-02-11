@@ -7,7 +7,7 @@
 #include "vera_psg.h"
 #include "vera_pcm.h"
 #include "wav_recorder.h"
-#include "ym2151.h"
+#include "ymglue.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -68,6 +68,7 @@ static int16_t * buffer;
 static uint32_t buffer_size = 0;
 static uint32_t rdidx = 0;
 static uint32_t wridx = 0;
+static uint32_t buffer_written = 0;
 static uint32_t vera_samp_pos_rd = 0;
 static uint32_t vera_samp_pos_wr = 0;
 static uint32_t vera_samp_pos_hd = 0;
@@ -78,8 +79,8 @@ static uint32_t vera_samps_per_host_samps = 0;
 static uint32_t ym_samps_per_host_samps = 0;
 static uint32_t limiter_amp = 0;
 
-static int32_t psg_buf[2 * SAMPLES_PER_BUFFER];
-static int32_t pcm_buf[2 * SAMPLES_PER_BUFFER];
+static int16_t psg_buf[2 * SAMPLES_PER_BUFFER];
+static int16_t pcm_buf[2 * SAMPLES_PER_BUFFER];
 static int16_t ym_buf[2 * SAMPLES_PER_BUFFER];
 
 uint32_t host_sample_rate = 0;
@@ -105,6 +106,7 @@ audio_callback(void *userdata, Uint8 *stream, int len)
 			spos += actual_len * SAMPLE_BYTES;
 			len -= actual_len * SAMPLE_BYTES;
 			rdidx = (rdidx + actual_len * 2) % buffer_size;
+			buffer_written -= actual_len * 2;
 		}
 	}
 	uint32_t actual_len = SDL_min(len / SAMPLE_BYTES, (wridx - rdidx) / 2);
@@ -113,6 +115,7 @@ audio_callback(void *userdata, Uint8 *stream, int len)
 		spos += actual_len * SAMPLE_BYTES;
 		len -= actual_len * SAMPLE_BYTES;
 		rdidx = (rdidx + actual_len * 2) % buffer_size;
+		buffer_written -= actual_len * 2;
 	}
 	if (len > 0) memset(&stream[spos], 0, len);
 }
@@ -144,6 +147,7 @@ audio_init(const char *dev_name, int num_audio_buffers)
 	buffer = malloc(buffer_size * sizeof(int16_t));
 	rdidx = 0;
 	wridx = 0;
+	buffer_written = 0;
 
 	SDL_AudioSpec desired;
 	SDL_AudioSpec obtained;
@@ -288,14 +292,14 @@ audio_render()
 		// Don't resample VERA outputs if the host sample rate is as desired
 		if (host_sample_rate == AUDIO_SAMPLERATE) {
 			pos = (vera_samp_pos_rd >> SAMP_POS_FRAC_BITS) * 2;
-			vera_out_l = ((psg_buf[pos] + pcm_buf[pos]) >> 8) * 32768;
-			vera_out_r = ((psg_buf[pos + 1] + pcm_buf[pos + 1]) >> 8) * 32768;
+			vera_out_l = ((int32_t)psg_buf[pos] + pcm_buf[pos]) << 14;
+			vera_out_r = ((int32_t)psg_buf[pos + 1] + pcm_buf[pos + 1]) << 14;
 		} else {
 			filter_idx = (vera_samp_pos_rd >> (SAMP_POS_FRAC_BITS - 8)) & 0xff;
+			pos = (vera_samp_pos_rd >> SAMP_POS_FRAC_BITS) * 2;
 			for (int j = 0; j < 8; j += 2) {
-				pos = (vera_samp_pos_rd >> SAMP_POS_FRAC_BITS) * 2;
-				samp[j] = (psg_buf[pos] + pcm_buf[pos]) >> 8;
-				samp[j + 1] = (psg_buf[pos + 1] + pcm_buf[pos + 1]) >> 8;
+				samp[j] = (int32_t)psg_buf[pos] + pcm_buf[pos];
+				samp[j + 1] = (int32_t)psg_buf[pos + 1] + pcm_buf[pos + 1];
 				pos = (pos + 2) & (SAMP_POS_MASK * 2);
 			}
 			vera_out_l += samp[0] * filter[256 + filter_idx];
@@ -308,8 +312,8 @@ audio_render()
 			vera_out_r += samp[7] * filter[511 - filter_idx];
 		}
 		filter_idx = (ym_samp_pos_rd >> (SAMP_POS_FRAC_BITS - 8)) & 0xff;
+		pos = (ym_samp_pos_rd >> SAMP_POS_FRAC_BITS) * 2;
 		for (int j = 0; j < 8; j += 2) {
-			pos = (ym_samp_pos_rd >> SAMP_POS_FRAC_BITS) * 2;
 			samp[j] = ym_buf[pos];
 			samp[j + 1] = ym_buf[pos + 1];
 			pos = (pos + 2) & (SAMP_POS_MASK * 2);
@@ -322,11 +326,11 @@ audio_render()
 		ym_out_r += samp[5] * filter[255 - filter_idx];
 		ym_out_l += samp[6] * filter[511 - filter_idx];
 		ym_out_r += samp[7] * filter[511 - filter_idx];
-		// Mixing is according to Proto3 hardware recording
+		// Mixing is according to the Developer Board
 		// Loudest single PSG channel is 1/8 times the max output
-		// mix = (psg + pcm) * 2 + ym / 2
-		int32_t mix_l = (vera_out_l >> 13) + (ym_out_l >> 16);
-		int32_t mix_r = (vera_out_r >> 13) + (ym_out_r >> 16);
+		// mix = (psg + pcm) * 2 + ym
+		int32_t mix_l = (vera_out_l >> 13) + (ym_out_l >> 15);
+		int32_t mix_r = (vera_out_r >> 13) + (ym_out_r >> 15);
 		uint32_t amp = SDL_max(SDL_abs(mix_l), SDL_abs(mix_r));
 		if (amp > 32767) {
 			uint32_t limiter_amp_new = (32767 << 16) / amp;
@@ -345,6 +349,13 @@ audio_render()
 	}
 	if ((wridx - wridx_old) > 0) {
 		wav_recorder_process(&buffer[wridx_old], (wridx - wridx_old) / 2);
+	}
+	buffer_written += len * 2;
+	if (buffer_written > buffer_size) {
+		// Prevent the buffer from overflowing by skipping the read pointer ahead.
+		uint32_t buffer_skip_amount = (buffer_written / buffer_size) * SAMPLES_PER_BUFFER * 2;
+		rdidx = (rdidx + buffer_skip_amount) % buffer_size;
+		buffer_written -= buffer_skip_amount;
 	}
 	SDL_UnlockAudioDevice(audio_dev);
 

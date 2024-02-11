@@ -10,6 +10,9 @@
 #include "smc.h"
 #include "glue.h"
 #include "i2c.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 // 0x01 0x00      - Power Off
 // 0x01 0x01      - Hard Reboot
@@ -20,9 +23,13 @@
 
 uint8_t activity_led;
 uint8_t mse_count = 0;
+bool smc_requested_reset = false;
 
 uint8_t
 smc_read(uint8_t a) {
+	uint8_t mouse_id;
+	uint8_t mouse_size;
+
 	switch (a){
 		// Offset that returns one byte from the keyboard buffer
 		case 7:
@@ -31,19 +38,30 @@ smc_read(uint8_t a) {
 		// Offset that returns three bytes from mouse buffer (one movement packet) or a single zero if there is not complete packet in the buffer
 		// mse_count keeps track of which one of the three bytes it's sending
 		case 0x21:
-			if (mse_count == 0 && i2c_mse_buffer_count() > 2) {		// If start of packet, check if there are at least three bytes in the buffer
+			mouse_id = mouse_get_device_id();
+			if (mouse_id == 3 || mouse_id == 4) {
+				mouse_size = 4;
+			}
+			else {
+				mouse_size = 3;
+			}
+
+			if (mse_count == 0 && i2c_mse_buffer_count() >= mouse_size) {		// If start of packet, check if there are at least three bytes in the buffer
 				mse_count++;
 				return i2c_mse_buffer_next();
 			}
 			else if (mse_count > 0) {								// If we have already started sending bytes, assume there is enough data in the buffer
 				mse_count++;
-				if (mse_count == 3) mse_count = 0;
+				if (mse_count == mouse_size) mse_count = 0;
 				return i2c_mse_buffer_next();
 			}
 			else {													// Return a single zero if no complete packet available
 				mse_count = 0;
 				return 0x00;
 			}
+
+		case 0x22:
+			return mouse_get_device_id();
 
 		default:
 			return 0xff;
@@ -56,19 +74,23 @@ smc_write(uint8_t a, uint8_t v) {
 		case 1:
 			if (v == 0) {
 				printf("SMC Power Off.\n");
+				main_shutdown();
+#ifdef __EMSCRIPTEN__
+				emscripten_force_exit(0);
+#endif
 				exit(0);
 			} else if (v == 1) {
-				machine_reset();
+				smc_requested_reset = true;
 			}
 			break;
 		case 2:
 			if (v == 0) {
-				machine_reset();
+				smc_requested_reset = true;
 			}
 			break;
 		case 3:
 			if (v == 0) {
-				// TODO NMI
+				nmi6502();
 			}
 			break;
 		case 4:
@@ -76,6 +98,10 @@ smc_write(uint8_t a, uint8_t v) {
 			break;
 		case 5:
 			activity_led = v;
+			break;
+
+		case 0x20:
+			mouse_set_device_id(v);
 			break;
 	}
 }

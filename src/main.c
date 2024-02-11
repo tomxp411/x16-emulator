@@ -26,20 +26,22 @@
 #include "serial.h"
 #include "i2c.h"
 #include "rtc.h"
+#include "smc.h"
 #include "vera_spi.h"
 #include "sdcard.h"
 #include "ieee.h"
 #include "glue.h"
 #include "debugger.h"
 #include "utf8.h"
+#include "iso_8859_15.h"
 #include "joystick.h"
-#include "utf8_encode.h"
 #include "rom_symbols.h"
-#include "ym2151.h"
+#include "ymglue.h"
 #include "audio.h"
 #include "version.h"
 #include "wav_recorder.h"
 #include "testbench.h"
+#include "cartridge.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -87,6 +89,7 @@ uint32_t stat[65536];
 
 bool debugger_enabled = false;
 char *paste_text = NULL;
+char *clipboard_buffer = NULL;
 char paste_text_data[65536];
 bool pasting_bas = false;
 
@@ -100,6 +103,7 @@ bool dump_ram = true;
 bool dump_bank = true;
 bool dump_vram = false;
 bool warp_mode = false;
+bool grab_mouse = false;
 echo_mode_t echo_mode;
 bool save_on_exit = true;
 bool disable_emu_cmd_keys = false;
@@ -110,16 +114,24 @@ bool has_via2 = false;
 gif_recorder_state_t record_gif = RECORD_GIF_DISABLED;
 char *gif_path = NULL;
 char *wav_path = NULL;
-char *fsroot_path = NULL;
-char *startin_path = NULL;
+uint8_t *fsroot_path = NULL;
+uint8_t *startin_path = NULL;
 uint8_t keymap = 0; // KERNAL's default
 int window_scale = 1;
-double screen_x_scale = 1.0;
+float screen_x_scale = 1.0;
+float window_opacity = 1.0;
 char *scale_quality = "best";
 bool test_init_complete=false;
 bool headless = false;
+bool fullscreen = false;
 bool testbench = false;
-SDL_RWops *cartridge_file;
+bool enable_midline = false;
+bool ym2151_irq_support = false;
+char *cartridge_path = NULL;
+
+bool using_hostfs = true;
+
+uint8_t MHZ = 8;
 
 #ifdef TRACE
 bool trace_mode = false;
@@ -179,13 +191,21 @@ label_for_address(uint16_t address)
 			labels = labels_bank6;
 			count = sizeof(addresses_bank6) / sizeof(uint16_t);
 			break;
-#if 0
-		case 7:
-			addresses = addresses_bank7;
-			labels = labels_bank7;
-			count = sizeof(addresses_bank7) / sizeof(uint16_t);
+		case 10:
+			addresses = addresses_bankA;
+			labels = labels_bankA;
+			count = sizeof(addresses_bankA) / sizeof(uint16_t);
 			break;
-#endif
+		case 11:
+			addresses = addresses_bankB;
+			labels = labels_bankB;
+			count = sizeof(addresses_bankB) / sizeof(uint16_t);
+			break;
+		case 12:
+			addresses = addresses_bankC;
+			labels = labels_bankC;
+			count = sizeof(addresses_bankC) / sizeof(uint16_t);
+			break;
 		default:
 			addresses = NULL;
 			labels = NULL;
@@ -265,9 +285,16 @@ machine_dump(const char* reason)
 	printf("Dumped system to %s.\n", filename);
 }
 
+void mouse_state_init(void)
+{
+	kernal_mouse_enabled = 0;
+	SDL_ShowCursor((mouse_grabbed || kernal_mouse_enabled) ? SDL_DISABLE : SDL_ENABLE);
+}
+
 void
 machine_reset()
 {
+	i2c_reset_state();
 	ieee_init();
 	memory_reset();
 	vera_spi_init();
@@ -276,7 +303,14 @@ machine_reset()
 		via2_init();
 	}
 	video_reset();
+	mouse_state_init();
 	reset6502();
+}
+
+void
+machine_nmi()
+{
+	nmi6502();
 }
 
 void
@@ -284,6 +318,7 @@ machine_paste(char *s)
 {
 	if (s) {
 		paste_text = s;
+		clipboard_buffer = s; // so that we can free this later
 		pasting_bas = true;
 	}
 }
@@ -295,90 +330,6 @@ machine_toggle_warp()
 	timing_init();
 }
 
-uint8_t
-iso8859_15_from_unicode(uint32_t c)
-{
-	// line feed -> carriage return
-	if (c == '\n') {
-		return '\r';
-	}
-
-	// translate Unicode characters not part of Latin-1 but part of Latin-15
-	switch (c) {
-		case 0x20ac: // '€'
-			return 0xa4;
-		case 0x160: // 'Š'
-			return 0xa6;
-		case 0x161: // 'š'
-			return 0xa8;
-		case 0x17d: // 'Ž'
-			return 0xb4;
-		case 0x17e: // 'ž'
-			return 0xb8;
-		case 0x152: // 'Œ'
-			return 0xbc;
-		case 0x153: // 'œ'
-			return 0xbd;
-		case 0x178: // 'Ÿ'
-			return 0xbe;
-	}
-
-	// remove Unicode characters part of Latin-1 but not part of Latin-15
-	switch (c) {
-		case 0xa4: // '¤'
-		case 0xa6: // '¦'
-		case 0xa8: // '¨'
-		case 0xb4: // '´'
-		case 0xb8: // '¸'
-		case 0xbc: // '¼'
-		case 0xbd: // '½'
-		case 0xbe: // '¾'
-			return '?';
-	}
-
-	// all other Unicode characters are also unsupported
-	if (c >= 256) {
-		return '?';
-	}
-
-	// everything else is Latin-15 already
-	return c;
-}
-
-uint32_t
-unicode_from_iso8859_15(uint8_t c)
-{
-	// translate Latin-15 characters not part of Latin-1
-	switch (c) {
-		case 0xa4:
-			return 0x20ac; // '€'
-		case 0xa6:
-			return 0x160; // 'Š'
-		case 0xa8:
-			return 0x161; // 'š'
-		case 0xb4:
-			return 0x17d; // 'Ž'
-		case 0xb8:
-			return 0x17e; // 'ž'
-		case 0xbc:
-			return 0x152; // 'Œ'
-		case 0xbd:
-			return 0x153; // 'œ'
-		case 0xbe:
-			return 0x178; // 'Ÿ'
-		default:
-			return c;
-	}
-}
-
-// converts the character to UTF-8 and prints it
-static void
-print_iso8859_15_char(char c)
-{
-	char utf8[5];
-	utf8_encode(utf8, unicode_from_iso8859_15(c));
-	printf("%s", utf8);
-}
 
 static bool
 is_kernal()
@@ -392,8 +343,11 @@ is_kernal()
 static void
 usage()
 {
-	printf("\nCommander X16 Emulator r%s (%s)\n", VER, VER_NAME);
-	printf("(C)2019,2022 Michael Steil et al.\n");
+	printf("\nCommander X16 Emulator r%s (%s)", VER, VER_NAME);
+#ifdef GIT_REV
+	printf(", "GIT_REV);
+#endif
+	printf("\n(C)2019, 2023 Michael Steil et al.\n");
 	printf("All rights reserved. License: 2-clause BSD\n\n");
 	printf("Usage: x16emu [option] ...\n\n");
 	printf("-rom <rom.bin>\n");
@@ -408,15 +362,19 @@ usage()
 	printf("\tEnable a specific keyboard layout decode table.\n");
 	printf("-sdcard <sdcard.img>\n");
 	printf("\tSpecify SD card image (partition map + FAT32)\n");
-	printf("-cart <cart.bin>\n");
-	printf("\tSpecify cartridge binary to be loaded ROM bank 32 and above\n");
-	printf("\tThis option enables the full 3.5MB RAM/ROM expansion\n");
+	printf("-cart <crtfile.crt>\n");
+	printf("\tLoads a specially-formatted cartridge file.\n");
+	printf("-cartbin <romfile.bin>\n");
+	printf("\tLoads a raw cartridge file starting at ROM bank 32. After\n");
+	printf("\tloading, all of the affected banks will function as RAM.\n");
 	printf("-serial\n");
 	printf("\tConnect host fs through Serial Bus [experimental]\n");
-	printf("-nohostieee\n");
-	printf("\tDisable host fs through IEEE API interception.\n");
-	printf("\tIEEE API host fs is normally enabled unless -sdcard or\n");
+	printf("-nohostieee / -nohostfs\n");
+	printf("\tDisable HostFS through IEEE API interception.\n");
+	printf("\tIEEE API HostFS is normally enabled unless -sdcard or\n");
 	printf("\t-serial is specified.\n");
+	printf("-hostfsdev <unit>\n");
+	printf("\tSet the HostFS IEEE device number. Range 8-31. Default: %d.\n", ieee_unit);
 	printf("-fsroot <directory>\n");
 	printf("\tSpecify the host filesystem directory path which is to\n");
 	printf("\tact as the emulated root directory of the Commander X16.\n");
@@ -428,6 +386,12 @@ usage()
 	printf("\totherwise it defaults to fsroot itself.\n");
 	printf("-noemucmdkeys\n");
 	printf("\tDisable emulator command keys.\n");
+	printf("-capture\n");
+	printf("\tStart emulator with mouse/keyboard captured.\n");
+	printf("-nokeyboardcapture\n");
+	printf("\tWhile in capture mode, causes the emulator not to intercept\n");
+	printf("\tkeyboard combinations which are used by the operating system,\n");
+	printf("\tsuch as Alt+Tab.\n");
 	printf("-prg <app.prg>[,<load_addr>]\n");
 	printf("\tLoad application from the *host filesystem* into RAM,\n");
 	printf("\teven if an SD card is attached.\n");
@@ -437,8 +401,6 @@ usage()
 	printf("\tkeyboard.\n");
 	printf("-run\n");
 	printf("\tStart the -prg/-bas program using RUN\n");
-	printf("-geos\n");
-	printf("\tLaunch GEOS at startup.\n");
 	printf("-warp\n");
 	printf("\tEnable warp mode, run emulator as fast as possible.\n");
 	printf("-echo [{iso|raw}]\n");
@@ -470,10 +432,16 @@ usage()
 	printf("\tScaling algorithm quality\n");
 	printf("-widescreen\n");
 	printf("\tStretch output to 16:9 resolution to mimic display of a widescreen monitor.\n");
+	printf("-fullscreen\n");
+	printf("\tStart up in fullscreen mode instead of in a window.\n");
+	printf("-opacity (0.0,...,1.0)\n");
+	printf("\tSet the opacity value (0.0 for transparent, 1.0 for opaque) of the window. (default: %.1f)\n", window_opacity);
 	printf("-debug [<address>]\n");
 	printf("\tEnable debugger. Optionally, set a breakpoint\n");
 	printf("-randram\n");
-	printf("\tSet all RAM to random values\n");
+	printf("\t(deprecated, no effect)\n");
+	printf("-zeroram\n");
+	printf("\tSet all RAM to zero instead of uninitialized random values\n");
 	printf("-wuninit\n");
 	printf("\tPrints warning to stdout if uninitialized RAM is accessed\n");
 	printf("-dump {C|R|B|V}...\n");
@@ -491,7 +459,8 @@ usage()
 	printf("\tSet the output device used for audio emulation\n");
 	printf("\tIf output device is 'none', no audio is generated\n");
 	printf("-abufs <number of audio buffers>\n");
-	printf("\tSet the number of audio buffers used for playback. (default: 8)\n");
+	printf("\tSet the number of audio buffers used for playback.\n");
+	printf("\tIf using HostFS, the default is 32, otherwise 8.\n");
 	printf("\tIncreasing this will reduce stutter on slower computers,\n");
 	printf("\tbut will increase audio latency.\n");
 	printf("-rtc\n");
@@ -500,6 +469,17 @@ usage()
 	printf("\tInstall the second VIA chip expansion at $9F10\n");
 	printf("-testbench\n");
 	printf("\tHeadless mode for unit testing with an external test runner\n");
+	printf("-mhz <integer>\n");
+	printf("\tRun the emulator with a system clock speed other than the default of\n");
+	printf("\t8 MHz. Valid values are in the range of 1-40, inclusive. This option\n");
+	printf("\tis meant mainly for benchmarking, and may not reflect accurate\n");
+	printf("\thardware behavior.\n");
+	printf("-midline-effects\n");
+	printf("\tApproximate mid-line raster effects when changing tile, sprite,\n");
+	printf("\tand palette data. Requires a fast host CPU.\n");
+	printf("-enable-ym2151-irq\n");
+	printf("\tConnect the YM2151 IRQ source to the emulated CPU. This option increases\n");
+	printf("\tCPU usage as audio render is triggered for every CPU instruction.\n");
 #ifdef TRACE
 	printf("-trace [<address>]\n");
 	printf("\tPrint instruction trace. Optionally, a trigger address\n");
@@ -531,11 +511,12 @@ main(int argc, char **argv)
 	char *prg_path = NULL;
 	char *bas_path = NULL;
 	char *sdcard_path = NULL;
-	char *cartridge_path = NULL;
-	bool run_geos = false;
 	bool run_test = false;
 	int test_number = 0;
 	int audio_buffers = 8;
+	bool zeroram = false;
+	bool audio_buffers_set = false;
+	bool hostfs_set = false;
 
 	const char *audio_dev_name = NULL;
 
@@ -547,6 +528,7 @@ main(int argc, char **argv)
 	// no ROM file is specified on the command line.
 	memcpy(rom_path, base_path, strlen(base_path) + 1);
 	strncpy(rom_path + strlen(rom_path), rom_filename, PATH_MAX - strlen(rom_path));
+	memory_randomize_ram(true);
 
 	argc--;
 	argv++;
@@ -568,8 +550,9 @@ main(int argc, char **argv)
 				usage();
 			}
 			int kb = atoi(argv[0]);
-			if (!((kb & 7)==0)) {
-				usage();
+			if (!((kb & 7)==0) || kb < 8 || kb > 2048) {
+				printf("-ram value must be a multiple of 8 in the range of 8-2048.\n");
+				exit(1);
 			}
 			num_ram_banks = kb /8;
 			argc--;
@@ -614,10 +597,6 @@ main(int argc, char **argv)
 			bas_path = argv[0];
 			argc--;
 			argv++;
-		} else if (!strcmp(argv[0], "-geos")) {
-			argc--;
-			argv++;
-			run_geos = true;
 		} else if (!strcmp(argv[0], "-test")) {
 			argc--;
 			argv++;
@@ -653,6 +632,17 @@ main(int argc, char **argv)
 				usage();
 			}
 			cartridge_path = argv[0];
+			argc--;
+			argv++;
+		} else if (!strcmp(argv[0], "-cartbin")) {
+			argc--;
+			argv++;
+			if (!argc || argv[0][0] == '-') {
+				usage();
+			}
+			cartridge_new();
+			cartridge_define_bank_range(32, 255, CART_BANK_UNINITIALIZED_RAM);
+			cartridge_import_files(argv, 1, 32, CART_BANK_INITIALIZED_RAM, 0);
 			argc--;
 			argv++;
 		} else if (!strcmp(argv[0], "-warp")) {
@@ -754,14 +744,28 @@ main(int argc, char **argv)
 			argv++;
 			debugger_enabled = true;
 			if (argc && argv[0][0] != '-') {
-				DEBUGSetBreakPoint((uint16_t)strtol(argv[0], NULL, 16));
+				uint32_t bpVal = (uint32_t)strtol(argv[0], NULL, 16);
+				struct breakpoint bp;
+				if (bpVal < 0xA000) {
+					bp.pc = bpVal;
+					bp.bank = -1;
+				} else {
+					bp.pc = bpVal & 0xffff;
+					bp.bank = bpVal >> 16;
+				}
+				DEBUGSetBreakPoint(bp);
 				argc--;
 				argv++;
 			}
 		} else if (!strcmp(argv[0], "-randram")) {
+			/* this operation has no effect anymore, randomizing the Ram is now default */
 			argc--;
 			argv++;
-			memory_randomize_ram(true);
+		} else if (!strcmp(argv[0], "-zeroram")) {
+			argc--;
+			argv++;
+			memory_randomize_ram(false);
+			zeroram = true;
 		} else if (!strcmp(argv[0], "-wuninit")) {
 			argc--;
 			argv++;
@@ -840,7 +844,20 @@ main(int argc, char **argv)
 		} else if (!strcmp(argv[0], "-widescreen")) {
 			argc--;
 			argv++;
-			screen_x_scale = 1.333;
+			screen_x_scale = 4.0/3;
+		} else if (!strcmp(argv[0], "-fullscreen")) {
+			argc--;
+			argv++;
+			fullscreen = true;
+		} else if (!strcmp(argv[0], "-opacity")) {
+			argc--;
+			argv++;
+			if (!argc || argv[0][0] == '-') {
+				usage();
+			}
+			window_opacity = strtof(argv[0], NULL);
+			argc--;
+			argv++;
 		} else if (!strcmp(argv[0], "-sound")) {
 			argc--;
 			argv++;
@@ -857,6 +874,7 @@ main(int argc, char **argv)
 				usage();
 			}
 			audio_buffers = (int)strtol(argv[0], NULL, 10);
+			audio_buffers_set = true;
 			argc--;
 			argv++;
 		} else if (!strcmp(argv[0], "-rtc")) {
@@ -867,17 +885,33 @@ main(int argc, char **argv)
 			argc--;
 			argv++;
 			has_serial = true;
-		} else if (!strcmp(argv[0], "-nohostieee")) {
+		} else if (!strcmp(argv[0], "-nohostieee") || !strcmp(argv[0], "-nohostfs")) {
 			argc--;
 			argv++;
 			no_ieee_intercept = true;
+			hostfs_set = false;
+			using_hostfs = false;
+		} else if (!strcmp(argv[0], "-hostfsdev")){
+			argc--;
+			argv++;
+			if (!argc || argv[0][0] == '-') {
+				usage();
+			}
+			ieee_unit = (uint8_t)strtol(argv[0], NULL, 10);
+			if (ieee_unit < 8 || ieee_unit > 31) {
+				usage();
+			}
+			hostfs_set = true;
+			using_hostfs = true;
+			argc--;
+			argv++;
 		} else if (!strcmp(argv[0], "-fsroot")) {
 			argc--;
 			argv++;
 			if (!argc || argv[0][0] == '-') {
 				usage();
 			}
-			fsroot_path = argv[0];
+			fsroot_path = (uint8_t *)argv[0];
 			argc--;
 			argv++;
 		} else if (!strcmp(argv[0], "-startin")) {
@@ -886,19 +920,32 @@ main(int argc, char **argv)
 			if (!argc || argv[0][0] == '-') {
 				usage();
 			}
-			startin_path = argv[0];
+			startin_path = (uint8_t *)argv[0];
 			argc--;
 			argv++;
 		} else if (!strcmp(argv[0], "-noemucmdkeys")) {
 			argc--;
 			argv++;
 			disable_emu_cmd_keys = true;
+		} else if (!strcmp(argv[0], "-capture")) {
+			argc--;
+			argv++;
+			grab_mouse = true;
+		} else if (!strcmp(argv[0], "-nokeyboardcapture")) {
+			argc--;
+			argv++;
+			no_keyboard_capture = true;
 		} else if (!strcmp(argv[0], "-via2")) {
 			argc--;
 			argv++;
 			has_via2 = true;
 		} else if (!strcmp(argv[0], "-version")){
 			printf("%s", VER_INFO);
+#ifdef GIT_REV
+			printf(" "GIT_REV"\n");
+#else
+			printf("\n");
+#endif
 			argc--;
 			argv++;
 			exit(0);
@@ -909,6 +956,26 @@ main(int argc, char **argv)
 			argv++;
 			testbench=true;
 			headless=true;
+		} else if (!strcmp(argv[0], "-mhz")){
+			argc--;
+			argv++;
+			if (!argc || argv[0][0] == '-') {
+				usage();
+			}
+			MHZ = (uint8_t)strtol(argv[0], NULL, 10);
+			if (MHZ < 1 || MHZ > 40) {
+				usage();
+			}
+			argc--;
+			argv++;
+		} else if (!strcmp(argv[0], "-midline-effects")){
+			argc--;
+			argv++;
+			enable_midline = true;
+		} else if (!strcmp(argv[0], "-enable-ym2151-irq")){
+			argc--;
+			argv++;
+			ym2151_irq_support = true;
 		} else {
 			usage();
 		}
@@ -933,15 +1000,24 @@ main(int argc, char **argv)
 
 	if (sdcard_path) {
 		sdcard_set_path(sdcard_path);
+		if (!hostfs_set) {
+			using_hostfs = false;
+		}
+	}
+
+	if (using_hostfs && !audio_buffers_set) {
+#ifdef __EMSCRIPTEN__
+		audio_buffers = 8; // wasm has larger buffers in audio.c, so we keep it 8 even w/ HostFS
+#else
+		audio_buffers = 32;
+#endif
 	}
 
 	if (cartridge_path) {
-		cartridge_file = SDL_RWFromFile(cartridge_path, "r+b");
-		if (!cartridge_file) {
+		if (!cartridge_load(cartridge_path, !zeroram)) {
 			printf("Cannot open %s!\n", cartridge_path);
 			exit(1);
 		}
-		cartridge_attach();
 	}
 
 	prg_override_start = -1;
@@ -975,9 +1051,6 @@ main(int argc, char **argv)
 		SDL_RWclose(bas_file);
 	}
 
-	if (run_geos) {
-		paste_text = "GEOS\r";
-	}
 	if (run_test) {
 		paste_text = paste_text_data;
 		snprintf(paste_text, sizeof(paste_text_data), "TEST %d\r", test_number);
@@ -988,10 +1061,13 @@ main(int argc, char **argv)
 	// Available since SDL 2.0.8
 	SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
+#ifdef __EMSCRIPTEN__
+	emscripten_set_main_loop(emscripten_main_loop, 0, 0);
+#endif
 	if (!headless) {
-		SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO);
+		SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER);
 		audio_init(audio_dev_name, audio_buffers);
-		video_init(window_scale, screen_x_scale, scale_quality);
+		video_init(window_scale, screen_x_scale, scale_quality, fullscreen, window_opacity);
 	}
 
 	wav_recorder_set_path(wav_path);
@@ -1009,16 +1085,26 @@ main(int argc, char **argv)
 	instruction_counter = 0;
 
 #ifdef __EMSCRIPTEN__
+	emscripten_cancel_main_loop();
 	emscripten_set_main_loop(emscripten_main_loop, 0, 1);
 #else
 	emulator_loop(NULL);
 #endif
 
+	main_shutdown();
+	return 0;
+}
+
+void main_shutdown() {
 	if (!headless){
 		wav_recorder_shutdown();
 		audio_close();
 		video_end();
 		SDL_Quit();
+	}
+	if(cartridge_path) {
+		cartridge_save_nvram();
+		cartridge_unload();
 	}
 	files_shutdown();
 
@@ -1048,7 +1134,6 @@ main(int argc, char **argv)
 	}
 #endif
 
-	return 0;
 }
 
 bool
@@ -1104,59 +1189,101 @@ handle_ieee_intercept()
 		return false;
 	}
 
+	if (pc < 0xFEB1 || !is_kernal()) {
+		return false;
+	}
+
 	if (has_serial) {
 		// if we do bit-level serial bus emulation, we don't
 		// do high-level KERNAL IEEE API interception
 		return false;
 	}
-
-	if (sdcard_attached && !prg_file) {
+	
+	if (sdcard_attached && !prg_file && !using_hostfs) {
 		// if should emulate an SD card (and don't need to
-		// hack a PRG into RAM), we'll always skip host fs
+		// hack a PRG into RAM), we skip HostFS if it uses unit 8
 		return false;
 	}
 
-	if (sdcard_attached && prg_file && prg_finished_loading) {
+	if (sdcard_attached && prg_file && prg_finished_loading && !using_hostfs) {
 		// also skip if we should do SD card and we're done
-		// with the PRG hack
+		// with the PRG hack if HostFS uses unit 8
 		return false;
 	}
 
-	if (!is_kernal() || pc < 0xFF44) {
-		return false;
-	}
+	uint64_t base_ticks = SDL_GetPerformanceCounter();
 
 	static int count_unlistn = 0;
 	bool handled = true;
 	int s = -1;
 	switch(pc) {
+		case 0xFEB1: {
+			uint16_t count = a;
+			s=MCIOUT(y << 8 | x, &count, status & 0x01);
+			if (s == -2) {
+				handled = false;
+			} else if (s == -3) {
+				status = (status | 1); // SEC (unsupported, or in this case, no open context)
+			} else {
+				x = count & 0xff;
+				y = count >> 8;
+				status &= 0xfe; // clear C -> supported
+			}
+			break;
+		}
 		case 0xFF44: {
 			uint16_t count = a;
 			s=MACPTR(y << 8 | x, &count, status & 0x01);
-			x = count & 0xff;
-			y = count >> 8;
-			status &= 0xfe; // clear C -> supported
+			if (s == -2) {
+				handled = false;
+			} else if (s == -3) {
+				status = (status | 1); // SEC (unsupported, or in this case, no open context)
+			} else {
+				x = count & 0xff;
+				y = count >> 8;
+				status &= 0xfe; // clear C -> supported
+			}
 			break;
 		}
 		case 0xFF93:
 			s=SECOND(a);
+			if (s == -2) {
+				handled = false;
+			}
 			break;
 		case 0xFF96:
-			TKSA(a);
+			s=TKSA(a);
+			if (s == -2) {
+				handled = false;
+			}
 			break;
 		case 0xFFA5:
 			s=ACPTR(&a);
-			status = (status & ~3) | (!a << 1); // unconditional CLC, and set zero flag based on byte read
+			if (s == -2) {
+				handled = false;
+			} else {
+				status = (status & ~3) | (!a << 1); // unconditional CLC, and set zero flag based on byte read
+			}
 			break;
 		case 0xFFA8:
 			s=CIOUT(a);
-			status = (status & ~1); // unconditonal CLC
+			if (s == -2) {
+				handled = false;
+			} else {
+				status = (status & ~1); // unconditonal CLC
+			}
 			break;
 		case 0xFFAB:
-			UNTLK();
+			s=UNTLK();
+			if (s == -2) {
+				handled = false;
+			}
 			break;
 		case 0xFFAE:
 			s=UNLSN();
+			if (s == -2) {
+				handled = false;
+			}
 			if (prg_file && sdcard_path_is_set() && ++count_unlistn == 4) {
 				// after auto-loading a PRG from the host fs,
 				// switch to the SD card if requested
@@ -1168,10 +1295,20 @@ handle_ieee_intercept()
 			}
 			break;
 		case 0xFFB1:
-			LISTEN(a);
+			s=LISTEN(a);
+			if (s == -2) {
+				handled = false;
+			} else {
+				status = (status & ~1); // unconditonal CLC
+			}
 			break;
 		case 0xFFB4:
-			TALK(a);
+			s=TALK(a);
+			if (s == -2) {
+				handled = false;
+			} else {
+				status = (status & ~1); // unconditonal CLC
+			}
 			break;
 		default:
 			handled = false;
@@ -1179,6 +1316,11 @@ handle_ieee_intercept()
 	}
 
 	if (handled) {
+		// Add the number CPU cycles equivalent to the amount of time that the operation actually took
+		// to prevent the emu from warping after a hostfs load
+		uint64_t perf_diff = SDL_GetPerformanceCounter() - base_ticks;
+		uint32_t missed_ticks = (uint64_t)(perf_diff * 1000000ULL * MHZ) / SDL_GetPerformanceFrequency();
+		clockticks6502 += missed_ticks;
 		if (s >= 0) {
 			if (!set_kernal_status(s)) {
 				printf("Warning: Could not set STATUS!\n");
@@ -1200,7 +1342,9 @@ emscripten_main_loop(void) {
 void *
 emulator_loop(void *param)
 {
+	uint32_t old_clockticks6502 = clockticks6502;
 	for (;;) {
+		if (smc_requested_reset) machine_reset();
 
 		if (testbench && pc == 0xfffd){
 			testbench_init();
@@ -1237,7 +1381,7 @@ emulator_loop(void *param)
 			if (lst) {
 				char *lf;
 				while ((lf = strchr(lst, '\n'))) {
-					for (int i = 0; i < 104; i++) {
+					for (int i = 0; i < 113; i++) {
 						printf(" ");
 					}
 					for (char *c = lst; c < lf; c++) {
@@ -1250,6 +1394,8 @@ emulator_loop(void *param)
 
 			printf("[%8d] ", instruction_counter);
 
+			int32_t eff_addr;
+
 			char *label = label_for_address(pc);
 			int label_len = label ? strlen(label) : 0;
 			if (label) {
@@ -1258,9 +1404,19 @@ emulator_loop(void *param)
 			for (int i = 0; i < 20 - label_len; i++) {
 				printf(" ");
 			}
-			printf(" %02x:.,%04x ", memory_get_rom_bank(), pc);
+
+			if (pc >= 0xc000) {
+				printf (" %02x", memory_get_rom_bank());
+			} else if (pc >= 0xa000) {
+				printf (" %02x", memory_get_ram_bank());
+			} else {
+				printf (" --");
+			}
+
+			printf(":.,%04x ", pc);
+
 			char disasm_line[15];
-			int len = disasm(pc, RAM, disasm_line, sizeof(disasm_line), false, 0);
+			int len = disasm(pc, RAM, disasm_line, sizeof(disasm_line), false, 0, &eff_addr);
 			for (int i = 0; i < len; i++) {
 				printf("%02x ", read6502(pc + i));
 			}
@@ -1277,28 +1433,19 @@ emulator_loop(void *param)
 				printf("%c", (status & (1 << i)) ? "czidb.vn"[i] : '-');
 			}
 
+			if (eff_addr == 0x9f23) {
+				printf(" v=$%05x", video_get_address(0));
+			} else if (eff_addr == 0x9f24) {
+				printf(" v=$%05x", video_get_address(1));
+			} else if (eff_addr >= 0) {
+				printf(" m=$%04x ", eff_addr);
+			} else {
+				printf("         ");
+			}
+
 			if (lst) {
 				printf("    %s", lst);
 			}
-
-#if 0
-			printf(" ---");
-			for (int i = 0; i < 6; i++) {
-				printf(" r%i:%04x", i, RAM[2 + i*2] | RAM[3 + i*2] << 8);
-			}
-			for (int i = 14; i < 16; i++) {
-				printf(" r%i:%04x", i, RAM[2 + i*2] | RAM[3 + i*2] << 8);
-			}
-
-			printf(" RAM:%01x", memory_get_ram_bank());
-			printf(" px:%d py:%d", RAM[0xa0e8] | RAM[0xa0e9] << 8, RAM[0xa0ea] | RAM[0xa0eb] << 8);
-
-//			printf(" c:%d", RAM[0xa0e2]);
-//			printf("-");
-//			for (int i = 0; i < 10; i++) {
-//				printf("%02x:", RAM[0xa041+i]);
-//			}
-#endif
 
 			printf("\n");
 		}
@@ -1308,9 +1455,9 @@ emulator_loop(void *param)
 			continue;
 		}
 
-		uint32_t old_clockticks6502 = clockticks6502;
 		step6502();
-		uint8_t clocks = clockticks6502 - old_clockticks6502;
+		uint32_t clocks = clockticks6502 - old_clockticks6502;
+		old_clockticks6502 = clockticks6502;
 		bool new_frame = false;
 		via1_step(clocks);
 		vera_spi_step(clocks);
@@ -1321,10 +1468,10 @@ emulator_loop(void *param)
 			via2_step(clocks);
 		}
 		if (!headless) {
-			new_frame |= video_step(MHZ, clocks);
+			new_frame |= video_step(MHZ, clocks, false);
 		}
 
-		for (uint8_t i = 0; i < clocks; i++) {
+		for (uint32_t i = 0; i < clocks; i++) {
 			i2c_step();
 		}
 		rtc_step(clocks);
@@ -1356,7 +1503,14 @@ emulator_loop(void *param)
 #endif
 		}
 
-		if (video_get_irq_out() || via1_irq() || (has_via2 && via2_irq())) {
+		// The optimization from the opportunistic batching of audio rendering 
+		// is lost if we need to track the YM2151 IRQ, so it has been made a
+		// command-line switch that's disabled by default.
+		if (ym2151_irq_support) {
+			audio_render();
+		}
+
+		if (video_get_irq_out() || via1_irq() || (has_via2 && via2_irq()) || (ym2151_irq_support && YM_irq())) {
 //			printf("IRQ!\n");
 			irq6502();
 		}
@@ -1368,73 +1522,83 @@ emulator_loop(void *param)
 			break;
 		}
 
-		if (echo_mode != ECHO_MODE_NONE && pc == 0xffd2 && is_kernal()) {
-			uint8_t c = a;
-			if (echo_mode == ECHO_MODE_COOKED) {
-				if (c == 0x0d) {
-					printf("\n");
-				} else if (c == 0x0a) {
-					// skip
-				} else if (c < 0x20 || c >= 0x80) {
-					printf("\\X%02X", c);
+		// Change this comparison value if ever additional KERNAL
+		// API calls are snooped in this routine.
+
+		if (pc >= 0xff68 && is_kernal()) {
+			if (pc == 0xff68) {
+				kernal_mouse_enabled = !!a;
+				SDL_ShowCursor((mouse_grabbed || kernal_mouse_enabled) ? SDL_DISABLE : SDL_ENABLE);
+			}
+
+			if (echo_mode != ECHO_MODE_NONE && pc == 0xffd2) {
+				uint8_t c = a;
+				if (echo_mode == ECHO_MODE_COOKED) {
+					if (c == 0x0d) {
+						printf("\n");
+					} else if (c == 0x0a) {
+						// skip
+					} else if (c < 0x20 || c >= 0x80) {
+						printf("\\X%02X", c);
+					} else {
+						printf("%c", c);
+					}
+				} else if (echo_mode == ECHO_MODE_ISO) {
+					if (c == 0x0d) {
+						printf("\n");
+					} else if (c == 0x0a) {
+						// skip
+					} else if (c < 0x20 || (c >= 0x80 && c < 0xa0)) {
+						printf("\\X%02X", c);
+					} else {
+						print_iso8859_15_char(c);
+					}
 				} else {
 					printf("%c", c);
 				}
-			} else if (echo_mode == ECHO_MODE_ISO) {
-				if (c == 0x0d) {
-					printf("\n");
-				} else if (c == 0x0a) {
-					// skip
-				} else if (c < 0x20 || (c >= 0x80 && c < 0xa0)) {
-					printf("\\X%02X", c);
-				} else {
-					print_iso8859_15_char(c);
-				}
-			} else {
-				printf("%c", c);
+				fflush(stdout);
 			}
-			fflush(stdout);
-		}
 
-		if (pc == 0xffcf && is_kernal()) {
-			// as soon as BASIC starts reading a line...
-			static bool prg_done = false;
+			if (pc == 0xffcf) {
+				// as soon as BASIC starts reading a line...
+				static bool prg_done = false;
 
-			if (prg_file && !prg_done) {
-				// LOAD":*" will cause the IEEE library
-				// to load from "prg_file"
-				if (prg_override_start >= 0) {
-					snprintf(paste_text_data, sizeof(paste_text_data), "LOAD\":*\",8,1,$%04X\r", prg_override_start);
-				} else {
-					snprintf(paste_text_data, sizeof(paste_text_data), "LOAD\":*\",8,1\r");
-				}
-				paste_text = paste_text_data;
-				prg_done = true;
-
-				if (run_after_load) {
+				if (prg_file && !prg_done) {
+					// LOAD":*" will cause the IEEE library
+					// to load from "prg_file"
 					if (prg_override_start >= 0) {
-						snprintf(strchr(paste_text_data, 0), sizeof(paste_text_data), "SYS$%04X\r", prg_override_start);
+						snprintf(paste_text_data, sizeof(paste_text_data), "LOAD\":*\",%d,1,$%04X\r", ieee_unit, prg_override_start);
 					} else {
-						snprintf(strchr(paste_text_data, 0), sizeof(paste_text_data), "RUN\r");
+						snprintf(paste_text_data, sizeof(paste_text_data), "LOAD\":*\",%d,1\r", ieee_unit);
+					}
+					paste_text = paste_text_data;
+					prg_done = true;
+
+					if (run_after_load) {
+						if (prg_override_start >= 0) {
+							snprintf(strchr(paste_text_data, 0), sizeof(paste_text_data), "SYS$%04X\r", prg_override_start);
+						} else {
+							snprintf(strchr(paste_text_data, 0), sizeof(paste_text_data), "RUN\r");
+						}
 					}
 				}
-			}
-			else if (testbench && !test_init_complete){
-				snprintf(paste_text_data, sizeof(paste_text_data), "SYS65533\r");
-				paste_text = paste_text_data;
-				test_init_complete=true;
+				else if (testbench && !test_init_complete){
+					snprintf(paste_text_data, sizeof(paste_text_data), "SYS65533\r");
+					paste_text = paste_text_data;
+					test_init_complete=true;
+				}
+
+				if (paste_text) {
+					// ...paste BASIC code into the keyboard buffer
+					pasting_bas = true;
+				}
 			}
 
-			if (paste_text) {
-				// ...paste BASIC code into the keyboard buffer
-				pasting_bas = true;
-			}
 		}
-
 #if 0 // enable this for slow pasting
 		if (!(instruction_counter % 100000))
 #endif
-		while (pasting_bas && RAM[NDX] < 10) {
+		while (pasting_bas && RAM[NDX] < 10 && !(status & 0x04)) {
 			uint32_t c;
 			int e = 0;
 
@@ -1453,6 +1617,10 @@ emulator_loop(void *param)
 			} else {
 				pasting_bas = false;
 				paste_text = NULL;
+				if (clipboard_buffer) {
+					SDL_free(clipboard_buffer);
+					clipboard_buffer = NULL;
+				}
 			}
 		}
 	}

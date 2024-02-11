@@ -2,22 +2,59 @@ name: Build Binaries
 on: [push, pull_request]
 
 jobs:
-  build-win64:
-    runs-on: windows-latest
+  README:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential make fonts-dejavu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install md-to-pdf (npm)
+        run: |
+          npm i md-to-pdf
+      - name: Create output directory
+        run: |
+          mkdir artifacts
+      - name: Create README
+        run: |
+          export PATH=$(pwd)/node_modules/.bin:$PATH
+          cat header_footer.md README.md RELEASES.md | md-to-pdf --config-file .gh/config.js --stylesheet .gh/markdown.css > "artifacts/README.pdf"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: readme-pdf
+          path: artifacts/*
+  build-win-x86_64:
+    needs: [README]
+    runs-on: windows-2019
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: make mingw-w64-x86_64-toolchain mingw-w64-x86_64-libelf mingw-w64-x86_64-SDL2
-      - name: Download latest ROM
-        id: download
+          install: make git mingw-w64-x86_64-toolchain mingw-w64-x86_64-libelf mingw-w64-x86_64-SDL2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
         run: |
           gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
         shell: cmd
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -26,40 +63,65 @@ jobs:
           cp latest_rom/*.h src/.
       - name: Build Emulator
         run: |
+          git reset --hard
+          git diff
           TRACE=1 CROSS_COMPILE_WINDOWS=1 SDL2CONFIG=sdl2-config make V=1 -j2
           mkdir emu_binaries
           cp $(which SDL2.dll) emu_binaries/.
           cp $(which zlib1.dll) emu_binaries/.
+          cp $(which libwinpthread-1.dll) emu_binaries/.
           cp sdcard.img.zip emu_binaries/.
           cp x16emu.exe emu_binaries/.
+          cp makecart.exe emu_binaries/.
           file emu_binaries/*
       - name: Copy ROM
         run: |
           cp latest_rom/rom.bin emu_binaries/.
           cp latest_rom/*.sym emu_binaries/.
-      - uses: actions/upload-artifact@v3
+      - name: Fetch README.pdf
+        run: gh run download -n "readme-pdf" --dir emu_binaries
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch x16-docs PDFs
+        run: gh run download -R X16Community/x16-docs -n x16-docs-pdf --dir emu_binaries
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: X16-Emu Windows 64-bit
+          name: x16emu_win64
           path: emu_binaries/*
-  build-win32:
-    runs-on: windows-latest
+  build-win-i686:
+    needs: [README]
+    runs-on: windows-2019
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: make mingw-w64-i686-toolchain mingw-w64-i686-libelf mingw-w64-i686-SDL2
+          install: make git mingw-w64-i686-toolchain mingw-w64-i686-libelf mingw-w64-i686-SDL2
           path-type: inherit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
       - name: Add /mingw32/bin to path
         run: echo "/mingw32/bin" >> $GITHUB_PATH
-      - name: Download latest ROM
-        id: download
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
         run: |
           gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
         shell: cmd
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -68,31 +130,55 @@ jobs:
           cp latest_rom/*.h src/.
       - name: Build Emulator
         run: |
+          git reset --hard
+          git diff
           TRACE=1 WIN_SDL2=/mingw32 TARGET_CPU=x86 CROSS_COMPILE_WINDOWS=1 make V=1 -j2
           mkdir emu_binaries
           cp $(which SDL2.dll) emu_binaries/.
           cp $(which zlib1.dll) emu_binaries/.
+          cp $(which libwinpthread-1.dll) emu_binaries/.
           cp sdcard.img.zip emu_binaries/.
           cp x16emu.exe emu_binaries/.
+          cp makecart.exe emu_binaries/.
           file emu_binaries/*
       - name: Copy ROM
         run: |
           cp latest_rom/rom.bin emu_binaries/.
           cp latest_rom/*.sym emu_binaries/.
-      - uses: actions/upload-artifact@v3
+      - name: Fetch README.pdf
+        run: gh run download -n "readme-pdf" --dir emu_binaries
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch x16-docs PDFs
+        run: gh run download -R X16Community/x16-docs -n x16-docs-pdf --dir emu_binaries
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: X16-Emu Windows 32-bit
+          name: x16emu_win32
           path: emu_binaries/*
-  build-lin64:
-    runs-on: ubuntu-latest
+  build-linux-x86_64:
+    needs: [README]  
+    runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential make libsdl2-dev
-      - name: Download latest ROM
-        id: download
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
         run: |
           gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Copy ROM symbols
@@ -104,27 +190,166 @@ jobs:
           mkdir emu_binaries
           cp sdcard.img.zip emu_binaries/.
           cp x16emu emu_binaries/.
+          cp makecart emu_binaries/.
           file emu_binaries/*
       - name: Copy ROM
         run: |
           cp latest_rom/rom.bin emu_binaries/.
           cp latest_rom/*.sym emu_binaries/.
-      - uses: actions/upload-artifact@v3
+      - name: Fetch README.pdf
+        run: gh run download -n "readme-pdf" --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch x16-docs PDFs
+        run: gh run download -R X16Community/x16-docs -n x16-docs-pdf --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: X16-Emu Linux 64-bit
+          name: x16emu_linux-x86_64
           path: emu_binaries/*
-  build-darwin-11-x64:
+  build-linux-aarch64:
+    needs: [README]
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update 
+          sudo apt-get install -y build-essential make qemu-user-static
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
+        run: |
+          gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy ROM symbols
+        run: |
+          cp latest_rom/*.h src/.
+      - name: Build Emulator
+        uses: pguyot/arm-runner-action@v2
+        with:
+          base_image: raspios_lite_arm64:2022-04-04
+          image_additional_mb: 8192
+          cpu: cortex-a53
+          copy_artifact_path: emu_binaries
+          commands: |
+            apt-get update
+            apt-get install -y build-essential make libsdl2-dev file git
+            TRACE=1 make V=1 -j3
+            mkdir emu_binaries
+            cp sdcard.img.zip emu_binaries/.
+            cp x16emu emu_binaries/.
+            cp makecart emu_binaries/.
+            file emu_binaries/*
+      - name: Copy ROM
+        run: |
+          sudo chown -R runner emu_binaries
+          cp latest_rom/rom.bin emu_binaries/.
+          cp latest_rom/*.sym emu_binaries/.
+      - name: Fetch README.pdf
+        run: gh run download -n "readme-pdf" --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch x16-docs PDFs
+        run: gh run download -R X16Community/x16-docs -n x16-docs-pdf --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x16emu_linux-aarch64
+          path: emu_binaries/*
+  build-linux-armhf:
+    needs: [README]
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update 
+          sudo apt-get install -y build-essential make qemu-user-static
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
+        run: |
+          gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy ROM symbols
+        run: |
+          cp latest_rom/*.h src/.
+      - name: Build Emulator
+        uses: pguyot/arm-runner-action@v2
+        with:
+          base_image: raspios_lite:2022-04-04
+          image_additional_mb: 8192
+          cpu: cortex-a7
+          copy_artifact_path: emu_binaries
+          commands: |
+            apt-get update
+            apt-get install -y build-essential make libsdl2-dev file git
+            TRACE=1 make V=1 -j3
+            mkdir emu_binaries
+            cp sdcard.img.zip emu_binaries/.
+            cp x16emu emu_binaries/.
+            cp makecart emu_binaries/.
+            file emu_binaries/*
+      - name: Copy ROM
+        run: |
+          sudo chown -R runner emu_binaries
+          cp latest_rom/rom.bin emu_binaries/.
+          cp latest_rom/*.sym emu_binaries/.
+      - name: Fetch README.pdf
+        run: gh run download -n "readme-pdf" --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch x16-docs PDFs
+        run: gh run download -R X16Community/x16-docs -n x16-docs-pdf --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x16emu_linux-armhf
+          path: emu_binaries/*
+  build-macos-x86_64:
+    needs: [README]
     # this is currently macos-11, Big Sur
     runs-on: macos-11
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Dependencies
         run: | 
-          brew install make sdl2 
-      - name: Download latest ROM
-        id: download
+          brew install make git sdl2 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
         run: |
           gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Copy ROM symbols
@@ -136,70 +361,62 @@ jobs:
           mkdir emu_binaries
           cp sdcard.img.zip emu_binaries/.
           cp x16emu emu_binaries/.
+          cp makecart emu_binaries/.
           file emu_binaries/*
       - name: Copy ROM
         run: |
           cp latest_rom/rom.bin emu_binaries/.
           cp latest_rom/*.sym emu_binaries/.
-      - uses: actions/upload-artifact@v3
-        with:
-          name: X16-Emu MacOS 11 Big Sur Intel 64-bit
-          path: emu_binaries/*
-  build-darwin-12-x64:
-    # this is currently macos-12, Monterey
-    runs-on: macos-12
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install Dependencies
-        run: | 
-          brew install make sdl2 
-      - name: Download latest ROM
-        id: download
-        run: |
-          gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+      - name: Fetch README.pdf
+        run: gh run download -n "readme-pdf" --dir emu_binaries
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Copy ROM symbols
-        run: |
-          cp latest_rom/*.h src/.
-      - name: Build Emulator
-        run: |
-          TRACE=1 MAC_STATIC=1 LIBSDL_FILE=/usr/local/Cellar/sdl2/*/lib/libSDL2.a make V=1 -j3
-          mkdir emu_binaries
-          cp sdcard.img.zip emu_binaries/.
-          cp x16emu emu_binaries/.
-          file emu_binaries/*
-      - name: Copy ROM
-        run: |
-          cp latest_rom/rom.bin emu_binaries/.
-          cp latest_rom/*.sym emu_binaries/.
-      - uses: actions/upload-artifact@v3
+      - name: Fetch x16-docs PDFs
+        run: gh run download -R X16Community/x16-docs -n x16-docs-pdf --dir emu_binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: X16-Emu MacOS 12 Monterey Intel 64-bit
+          name: x16emu_macos
           path: emu_binaries/*
   build-wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential make libsdl2-dev
-      - uses: mymindstorm/setup-emsdk@v12
-      - name: Download latest ROM
-        id: download
+      - uses: mymindstorm/setup-emsdk@v14
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
         run: |
           gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build Emulator
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy ROM symbols
+        run: |
+          cp latest_rom/*.h src/.
+      - name: Copy ROM
         run: |
           cp latest_rom/rom.bin .
+      - name: Build Emulator
+        run: |
           make V=1 -j3 wasm
           mkdir emu_binaries
           cp x16emu.data x16emu.html x16emu.js x16emu.wasm emu_binaries/
           mkdir emu_binaries/webassembly
-          cp webassembly/styles.css webassembly/main.js emu_binaries/webassembly/
+          cp webassembly/styles.css webassembly/main.js webassembly/jszip.min.js emu_binaries/webassembly/
           file emu_binaries/*
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
-          name: X16-Emu WebAssembly
+          name: x16emu_wasm
           path: emu_binaries/*
+

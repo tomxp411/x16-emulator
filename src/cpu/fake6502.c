@@ -134,7 +134,7 @@ uint8_t sp, a, x, y, status;
 //helper variables
 uint32_t instructions = 0; //keep track of total instructions executed
 uint32_t clockticks6502 = 0, clockgoal6502 = 0;
-uint16_t oldpc, ea, reladdr, value, result;
+uint16_t opcode_addr, oldpc, ea, reladdr, value, result;
 uint8_t opcode, oldstatus;
 
 uint8_t penaltyop, penaltyaddr;
@@ -144,6 +144,7 @@ uint8_t waiting = 0;
 extern uint8_t read6502(uint16_t address);
 extern void write6502(uint16_t address, uint8_t value);
 extern void stop6502(uint16_t address);
+extern void vp6502();
 
 #include "support.h"
 #include "modes.h"
@@ -174,7 +175,9 @@ void nmi6502() {
     push8(status & ~FLAG_BREAK);
     setinterrupt();
     cleardecimal();
+    vp6502();
     pc = (uint16_t)read6502(0xFFFA) | ((uint16_t)read6502(0xFFFB) << 8);
+    clockticks6502 += 7; // consumed by CPU to process interrupt
     waiting = 0;
 }
 
@@ -184,7 +187,9 @@ void irq6502() {
         push8(status & ~FLAG_BREAK);
         setinterrupt();
         cleardecimal();
+        vp6502();
         pc = (uint16_t)read6502(0xFFFE) | ((uint16_t)read6502(0xFFFF) << 8);
+        clockticks6502 += 7; // consumed by CPU to process interrupt
     }
     waiting = 0;
 }
@@ -225,6 +230,8 @@ void step6502() {
 		clockgoal6502 = clockticks6502;
 		return;
 	}
+
+    opcode_addr = pc;
 
     opcode = read6502(pc++);
     status |= FLAG_CONSTANT;
